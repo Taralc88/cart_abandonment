@@ -1,0 +1,943 @@
+---
+title: "Cart Abandonment Redefined"
+date: 10/26/2025
+format: 
+  html:
+    toc: true
+    toc-depth: 4
+    number-sections: true
+    number-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    code-fold: false
+    code-summary: "Click to Show Code"
+    embed-resources: true
+execute:
+  include: true
+  eval: true    
+  warning: false
+  message: false---
+---
+
+# Setup
+
+## Libraries
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(janitor)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(here)
+library(GGally)
+library(ggplot2)
+library(rpart)
+library(rpart.plot)
+```
+
+## Data
+```{r}
+cart_sessions_matched <- fread("cart_sessions_matched.csv")
+
+customer <- fread("customer.csv") |>
+  clean_names() |>
+  rename(customer_id = customer_number)
+
+google_analytics <- fread("google_analytics.csv") |>
+  clean_names()
+
+orders <- fread("orders.csv") |>
+  clean_names()
+```
+
+
+```{r}
+# GA timestamps - change to the same datatype we are using for orders
+google_analytics[, event_timestamp_est := force_tz(event_timestamp, tzone = "America/New_York")]
+
+# Orders timestamps - convert from UTC to EST
+orders[, created_timestamp_est := with_tz(created_date_utc, tzone = "America/New_York")]
+```
+
+
+```{r}
+
+modeling_data_sessions <- copy(cart_sessions_matched)
+
+# Make sure both are data.tables
+setDT(google_analytics)
+setDT(modeling_data_sessions)
+setDT(orders)
+
+# Keys for efficient joins
+setkey(google_analytics, customer_id, event_timestamp_est)
+setkey(modeling_data_sessions, customer_id, session_start)
+setkey(orders, customer_id, created_date_est)
+```
+
+
+# Feature Engineering
+
+## Helper Functions
+
+```{r}
+# Return NA if input is empty or all NA, otherwise compute min/max
+safe_min <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) NA_real_ else min(x, na.rm = TRUE)
+}
+
+safe_max <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+}
+```
+
+## Session Stats
+```{r}
+cat("Step 1: Creating session-level features...\n")
+
+# Temporal features based on session_start
+modeling_data_sessions[, `:=`(
+  hour_of_day = hour(session_start),
+  day_of_week = wday(session_start),
+  day_of_month = mday(session_start),
+  month = month(session_start),
+  is_weekend = ifelse(wday(session_start) %in% c(1, 7), 1, 0),
+  is_business_hours = ifelse(hour(session_start) >= 9 & hour(session_start) <= 17, 1, 0),
+  is_evening = ifelse(hour(session_start) >= 18, 1, 0),
+  is_morning = ifelse(hour(session_start) >= 6 & hour(session_start) < 12, 1, 0),
+  session_date = as.Date(session_start)
+)]
+
+# Session-specific features
+modeling_data_sessions[, `:=`(
+  is_quick_session = ifelse(session_duration_mins < 5, 1, 0),
+  is_long_session = ifelse(session_duration_mins > 30, 1, 0),
+  many_adds = ifelse(n_adds >= 5, 1, 0)
+)]
+```
+
+## Customer Before Session
+
+```{r}
+########## Cheanges made here to stop data Leakage ##### 
+###### Only allowing Past Transactions, not future #####
+
+# Rolling temporal join — only events before each session_start
+customer_overall_stats <- google_analytics[
+  modeling_data_sessions,
+  on = .(customer_id, event_timestamp_est < session_start),
+  .(
+    total_purchases_before = sum(event_name == "purchase", na.rm = TRUE),
+    total_add_to_carts_before = sum(event_name == "add_to_cart", na.rm = TRUE),
+    total_page_views_before = sum(event_name == "page_view", na.rm = TRUE),
+    total_events_before = .N,
+    first_event_date = if (.N > 0) min(event_timestamp_est, na.rm = TRUE) else as.POSIXct(NA),
+    last_event_date = if (.N > 0) max(event_timestamp_est, na.rm = TRUE) else as.POSIXct(NA),
+    # tenure in days (session_start - first event)
+    customer_days_since_first_event = if (.N > 0)
+      as.numeric(difftime(session_start, min(event_timestamp_est, na.rm = TRUE), units = "days"))
+    else NA_real_
+  ),
+  by = .EACHI
+]
+
+modeling_data_sessions <- cbind(
+  modeling_data_sessions,
+  customer_overall_stats[, -c("customer_id", "session_start"), with = FALSE]
+)
+```
+
+## Customer Ordering Before Session
+
+```{r}
+# Rolling temporal join — only orders before each session_start
+customer_order_stats <- orders[
+  modeling_data_sessions,
+  on = .(customer_id, created_timestamp_est < session_start),
+  .(
+    session_start = session_start,
+    total_orders_before = as.integer(uniqueN(created_timestamp_est)),
+    total_order_items_before = as.integer(.N),
+    avg_order_quantity_before = if (.N > 0) as.numeric(mean(order_quantity, na.rm = TRUE)) else NA_real_,
+    pct_call_center_before = if (.N > 0) as.numeric(sum(order_type == "CALL CENTER", na.rm = TRUE) / .N) else NA_real_,
+    unique_materials_ordered_before = as.integer(if (.N > 0) uniqueN(material_id) else 0),
+    unique_plants_before = as.integer(if (.N > 0) uniqueN(plant_id) else 0),
+    days_since_first_order = as.numeric(difftime(session_start, safe_min(created_timestamp_est), units = "days"))
+  ),
+  by = .EACHI
+]
+
+# Merge safely into session-level table
+modeling_data_sessions <- merge(
+  modeling_data_sessions,
+  customer_order_stats,
+  by = c("customer_id", "session_start"),
+  all.x = TRUE
+)
+```
+
+## Daily Sessions
+
+```{r}
+# Session frequency features (how many sessions this customer had that day)
+daily_session_counts <- modeling_data_sessions[, .(
+  sessions_same_day = .N
+), by = .(customer_id, session_date)]
+
+modeling_data_sessions <- merge(modeling_data_sessions, daily_session_counts, 
+                               by = c("customer_id", "session_date"), all.x = TRUE)
+
+# Session sequence
+modeling_data_sessions[order(customer_id, session_start), 
+                      session_sequence_in_day := seq_len(.N), 
+                      by = .(customer_id, session_date)]
+
+# Clean up NAs
+numeric_cols <- names(modeling_data_sessions)[sapply(modeling_data_sessions, is.numeric)]
+for (col in numeric_cols) {
+  modeling_data_sessions[is.na(get(col)), (col) := 0]
+}
+
+# Create derived features
+modeling_data_sessions[, purchase_to_cart_ratio := ifelse(total_add_to_carts_before > 0, 
+                                                           total_purchases_before / total_add_to_carts_before, 
+                                                           0)]
+
+modeling_data_sessions[, avg_adds_per_session := total_add_to_carts_before / 
+                                                 (.N + 1)]  # +1 to avoid division by zero
+
+cat("✓ Session-level modeling dataset ready\n\n")
+
+# SUMMARY
+cat("=== SESSION-BASED MODELING DATASET ===\n")
+cat("Total sessions:", nrow(modeling_data_sessions), "\n")
+cat("Total features:", ncol(modeling_data_sessions), "\n")
+cat("Target: session_abandoned\n")
+cat("Abandonment rate:", round(mean(modeling_data_sessions$session_abandoned) * 100, 2), "%\n\n")
+
+cat("Key differences from event-level:\n")
+cat("- Unit of analysis: Session (not individual add_to_cart)\n")
+cat("- Features: session_duration_mins, n_adds, sessions_same_day\n")
+cat("- Better captures: Shopping behavior patterns\n\n")
+
+cat("✓ Ready for session-based modeling!\n")
+```
+
+## Google Analytics (More Features)
+
+### Important GA Events Defined
+
+```{r}
+
+cart_events <- c("add_to_cart", "update_cart", "remove_from_cart")
+checkout_events <- c("view_cart", "proceed_to_checkout", "begin_checkout", "checkout_page_displayed")
+error_events <- c("Error_Updating_Session_Delivery", "Update_Cart_Details_For_Payment_Failed", 
+                  "Payment_API_Failed", "Get_Active_Cart_Items_Failed")
+
+# Combine all events we care about
+predictive_events <- c(cart_events, checkout_events, error_events)
+```
+
+### Count of Predictive GA Events
+
+```{r}
+# Counts per session of Each Event Group
+session_event_counts <- google_analytics[modeling_data_sessions,
+  on = .(customer_id, event_timestamp_est >= session_start, event_timestamp_est <= session_end),
+  .(
+    cart_event_count = sum(event_name %in% cart_events, na.rm = TRUE),
+    checkout_event_count = sum(event_name %in% checkout_events, na.rm = TRUE),
+    error_event_count = sum(event_name %in% error_events, na.rm = TRUE)
+  ),
+  by = .EACHI
+]
+
+# Merge counts into modeling_data_sessions
+modeling_data_sessions <- cbind(modeling_data_sessions, 
+                                session_event_counts[, .(cart_event_count, checkout_event_count, error_event_count)])
+```
+
+
+```{r}
+session_event_counts_individual <- google_analytics[modeling_data_sessions,
+  on = .(customer_id, event_timestamp_est >= session_start, event_timestamp_est <= session_end),
+  .(
+    session_start = session_start,     # include session_start
+    session_end = session_end,         # include session_end
+    event_name = event_name,
+    event_name_count = .N
+  ),
+  .EACHI
+][event_name %in% predictive_events]
+
+# Aggregate counts first
+session_event_counts_agg <- session_event_counts_individual[
+  , .(event_name_count = sum(event_name_count)),
+  by = .(customer_id, session_start, session_end, event_name)
+]
+
+# Then pivot
+session_event_counts_wide <- dcast(
+  session_event_counts_agg,
+  customer_id + session_start + session_end ~ event_name,
+  value.var = "event_name_count",
+  fill = 0
+)
+
+# Merge into your sessions table
+modeling_data_sessions <- merge(
+  modeling_data_sessions,
+  session_event_counts_wide,
+  by = c("customer_id", "session_start", "session_end"),
+  all.x = TRUE
+)
+```
+
+
+```{r}
+
+# tenure has a huge part of how many orders you have already had so I want a measurement of this ratio divided by how long you have been ordering wtih them
+modeling_data_sessions <- modeling_data_sessions %>%
+  mutate(
+    purchase_cart_per_day = purchase_to_cart_ratio / (days_since_first_order + 1)  # +1 to avoid division by zero
+  )
+# People that are often ordering very often tend to be different than the others. 
+modeling_data_sessions <- modeling_data_sessions %>%
+  mutate(
+    orders_per_day = total_purchases_before / (days_since_first_order + 1)  # +1 to avoid division by zero
+  )
+```
+
+
+#### Exclude Columns
+
+```{r}
+
+exclude_cols <- c("customer_id", "session_id", "session_start", "session_end", 
+                  "matched_purchase_ts", "session_date", 
+                  "first_event_date", "last_event_date", "source", 
+                  "time_to_purchase_hours", "time_since_last", "customer_changed", "new_session")
+
+# Exclude specific columns
+cart_sessions_model_data <- modeling_data_sessions %>%
+  select(-any_of(exclude_cols))
+```
+
+## Latest Sessions
+
+```{r}
+# Filter to latest session per customer
+latest_sessions <- modeling_data_sessions[order(customer_id, -session_start), .SD[1], by = customer_id]
+```
+
+
+# Visualize Features
+
+## Top Predictive Features
+
+```{r}
+
+# Fit the tree
+tree_model <- rpart(
+  session_abandoned ~ .,              # target vs all numeric predictors
+  data = cart_sessions_model_data,
+  method = "class",                   # classification tree
+  control = rpart.control(
+    minsplit = 20,                    # minimum rows to attempt a split
+    cp = 0.01,                        # complexity parameter to prune tree
+    maxdepth = 4                      # keep tree shallow
+  )
+)
+
+rpart.plot(
+  tree_model,
+  type = 2,        # type 2 = labels inside nodes
+  extra = 104,     # show probability per class and % observations
+  fallen.leaves = TRUE,
+  cex = 0.8
+)
+```
+
+```{r}
+# Fit tree with very low cp
+tree_model <- rpart(
+  session_abandoned ~ .,
+  data = cart_sessions_model_data,
+  method = "class",
+  control = rpart.control(minsplit = 10, cp = 0.002, maxdepth = 6)
+)
+
+# Plot the tree
+rpart.plot(tree_model, type = 2, extra = 104, fallen.leaves = TRUE, cex = 0.8, nn = TRUE)
+```
+
+## Purchase to Cart Ratio
+
+### Distributions
+
+```{r}
+ggplot(modeling_data_sessions, aes(x = as.factor(session_abandoned), y = purchase_to_cart_ratio, fill = as.factor(session_abandoned))) +
+  geom_violin(alpha = 0.6) +                          # violin shape
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +  # boxplot inside
+  labs(
+    x = "Session Abandoned",
+    y = "Purchase to Cart Ratio",
+    fill = "Session Abandoned"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12),
+    legend.position = "none"
+  )
+```
+
+
+```{r}
+ggplot(modeling_data_sessions, aes(x = as.factor(session_abandoned), y = purchase_to_cart_ratio, fill = as.factor(session_abandoned))) +
+  geom_violin(alpha = 0.6) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  labs(
+    x = "Session Abandoned",
+    y = "Purchase to Cart Ratio",
+    fill = "Session Abandoned"
+  ) +
+  theme_minimal() +
+  theme(text = element_text(size = 12), legend.position = "none") +
+  coord_cartesian(ylim = c(0, 1))  # zoom to range 0–1
+```
+
+```{r}
+ggplot(modeling_data_sessions, aes(x = as.factor(session_abandoned), y = purchase_to_cart_ratio + 1e-5, fill = as.factor(session_abandoned))) +
+  geom_violin(alpha = 0.6) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  scale_y_log10() +
+  labs(
+    x = "Session Abandoned",
+    y = "Purchase to Cart Ratio (log scale)",
+    fill = "Session Abandoned"
+  ) +
+  theme_minimal() +
+  theme(text = element_text(size = 12), legend.position = "none")
+```
+### Purchase Vs Cart %
+
+```{r}
+ggplot(modeling_data_sessions, aes(
+  x = total_add_to_carts_before,
+  y = total_purchases_before,
+  color = as.factor(session_abandoned)
+)) +
+  geom_point(alpha = 0.6) +  # semi-transparent points
+  # Reference lines
+  geom_abline(intercept = 0, slope = 1, linetype = "solid", color = "black", size = 1) +    # 1:1 line
+  geom_abline(intercept = 0, slope = 0.07, linetype = "dashed", color = "black", size = 1) + 
+  geom_abline(intercept = 0, slope = 0.14, linetype = "dashed", color = "black", size = 1) + 
+  geom_abline(intercept = 0, slope = 0.40, linetype = "dashed", color = "black", size = 1) + 
+  scale_color_manual(values = c("0" = "blue", "1" = "red")) +
+  labs(
+    x = "Total Add-to-Carts Before",
+    y = "Total Purchases Before",
+    color = "Session Abandoned"
+  ) +
+  theme_minimal() +
+  theme(text = element_text(size = 12))
+```
+
+
+```{r}
+
+ggplot(modeling_data_sessions, aes(
+  x = total_add_to_carts_before,
+  y = total_purchases_before,
+  color = as.factor(session_abandoned)
+)) +
+  geom_point(alpha = 0.6) +
+  
+  # Reference lines
+  geom_abline(intercept = 0, slope = 1, linetype = "solid", color = "black", size = 1) +
+  geom_abline(intercept = 0, slope = 0.07, linetype = "dashed", color = "black", size = 1) +
+  geom_abline(intercept = 0, slope = 0.14, linetype = "dashed", color = "black", size = 1) +
+  geom_abline(intercept = 0, slope = 0.40, linetype = "dashed", color = "black", size = 1) +
+  
+  # Labels for each line
+  annotate("text", 
+           x = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE),
+           y = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE) * 1, 
+           label = "1:1", hjust = -0.1, vjust = -0.5, color = "black", size = 3) +
+  annotate("text", 
+           x = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE),
+           y = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE) * 0.07, 
+           label = "0.07", hjust = -0.1, vjust = -0.5, color = "black", size = 3) +
+  annotate("text", 
+           x = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE),
+           y = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE) * 0.14, 
+           label = "0.14", hjust = -0.1, vjust = -0.5, color = "black", size = 3) +
+  annotate("text", 
+           x = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE),
+           y = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE) * 0.40, 
+           label = "0.40", hjust = -0.1, vjust = -0.5, color = "black", size = 3) +
+
+  scale_color_manual(values = c("0" = "blue", "1" = "red")) +
+  labs(
+    x = "Total Add-to-Carts Before",
+    y = "Total Purchases Before",
+    color = "Session Abandoned"
+  ) +
+  theme_minimal() +
+  theme(text = element_text(size = 12))
+
+```
+
+```{r}
+
+
+# Base plot with all sessions
+p <- ggplot(modeling_data_sessions, aes(
+  x = total_add_to_carts_before,
+  y = total_purchases_before,
+  color = as.factor(session_abandoned)
+)) +
+  geom_point(alpha = 0.3) +  # all sessions, transparent
+  geom_point(data = latest_sessions, aes(
+    x = total_add_to_carts_before,
+    y = total_purchases_before
+  ), shape = 21, color = "black", fill = "yellow", size = 3, stroke = 1) +  # latest session highlighted
+  # Reference lines
+  geom_abline(intercept = 0, slope = 1, linetype = "solid", color = "black", size = 1) +
+  geom_abline(intercept = 0, slope = 0.07, linetype = "dashed", color = "black", size = 1) +
+  geom_abline(intercept = 0, slope = 0.14, linetype = "dashed", color = "black", size = 1) +
+  geom_abline(intercept = 0, slope = 0.40, linetype = "dashed", color = "black", size = 1) +
+  # Labels for lines
+  annotate("text", 
+           x = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE),
+           y = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE) * 1, 
+           label = "1:1", hjust = -0.1, vjust = -0.5, color = "black", size = 3) +
+  annotate("text", 
+           x = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE),
+           y = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE) * 0.07, 
+           label = "0.07", hjust = -0.1, vjust = -0.5, color = "black", size = 3) +
+  annotate("text", 
+           x = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE),
+           y = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE) * 0.14, 
+           label = "0.14", hjust = -0.1, vjust = -0.5, color = "black", size = 3) +
+  annotate("text", 
+           x = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE),
+           y = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE) * 0.40, 
+           label = "0.40", hjust = -0.1, vjust = -0.5, color = "black", size = 3) +
+  scale_color_manual(values = c("0" = "blue", "1" = "red")) +
+  labs(
+    x = "Total Add-to-Carts Before",
+    y = "Total Purchases Before",
+    color = "Session Abandoned"
+  ) +
+  theme_minimal() +
+  theme(text = element_text(size = 12))
+
+p
+```
+
+```{r}
+# Pick the latest session overall
+latest_point <- latest_sessions[which.max(total_purchases_before)]
+
+# Plot with label and red point
+p <- 
+  p + 
+  # Red point for the latest session
+  geom_point(
+    data = latest_point,
+    aes(
+      x = total_add_to_carts_before,
+      y = total_purchases_before
+    ),
+    color = "red",
+    size = 3
+  ) +
+  # Label for the point
+  geom_text(
+    data = latest_point,
+    aes(
+      x = total_add_to_carts_before,
+      y = total_purchases_before,
+      label = customer_id
+    ),
+    vjust = -1,       # position label slightly above
+    hjust = 0.5,
+    color = "black",
+    size = 4
+  )
+
+p
+
+```
+
+
+
+### Current Ratio
+
+```{r}
+Current_Purchase_to_Cart_ratio <- mean(latest_sessions$purchase_to_cart_ratio)
+
+print(Current_Purchase_to_Cart_ratio)
+```
+
+```{r}
+p +
+  # Add a red dashed line with slope 0.226 and intercept 0
+  geom_abline(
+    intercept = 0,
+    slope = 0.226,
+    color = "red",
+    linetype = "dashed",
+    size = 1
+  ) +
+  # Optional label at the end of the line
+  annotate(
+    "text",
+    x = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE) - 280,
+    y = max(modeling_data_sessions$total_add_to_carts_before, na.rm = TRUE) * 0.226 + 20,
+    label = "Current Ratio",
+    color = "red",
+    hjust = -0.1,
+    vjust = -0.5,
+    size = 3
+  )
+```
+
+
+### Ratio Over Time
+
+```{r}
+# Compute average per session_date and customer
+avg_by_customer <- modeling_data_sessions[, .(
+  avg_purchase_to_cart_ratio = mean(purchase_to_cart_ratio, na.rm = TRUE)
+), by = .(session_date, customer_id)]
+
+# Compute overall daily average
+avg_overall <- modeling_data_sessions[, .(
+  avg_purchase_to_cart_ratio = mean(purchase_to_cart_ratio, na.rm = TRUE)
+), by = session_date]
+
+# Filter for a specific customer
+avg_of_customer <- avg_by_customer[customer_id == 500810943]
+```
+
+
+```{r}
+# Ensure data.table
+setDT(avg_of_customer)
+setDT(avg_overall)
+
+# Sort by date
+setorder(avg_of_customer, session_date)
+setorder(avg_overall, session_date)
+
+# Compute 30-day rolling averages
+avg_of_customer[, avg_purchase_to_cart_ratio_30d := frollmean(avg_purchase_to_cart_ratio, n = 30, align = "right", na.rm = TRUE)]
+avg_overall[, avg_purchase_to_cart_ratio_30d := frollmean(avg_purchase_to_cart_ratio, n = 30, align = "right", na.rm = TRUE)]
+
+# Get last points for labeling
+latest_customer_point <- avg_of_customer[!is.na(avg_purchase_to_cart_ratio_30d)][.N]  # last non-NA
+latest_overall_point  <- avg_overall[!is.na(avg_purchase_to_cart_ratio_30d)][.N]
+
+# Small offsets
+y_offset <- 0.02   # vertical offset above the point
+x_offset <- -5     # horizontal offset to the left (in days)
+
+# Plot
+ggplot() +
+  # Customer rolling average
+  geom_line(data = avg_of_customer, aes(
+    x = session_date,
+    y = avg_purchase_to_cart_ratio_30d,
+    group = customer_id
+  ), alpha = 0.7, color = "blue") +
+  # Overall rolling average
+  geom_line(data = avg_overall, aes(
+    x = session_date,
+    y = avg_purchase_to_cart_ratio_30d
+  ), color = "black", size = 1.2, linetype = "dashed") +
+  # Labels slightly above and to the left
+  geom_text(data = latest_customer_point, aes(
+    x = session_date + x_offset, 
+    y = avg_purchase_to_cart_ratio_30d + y_offset,
+    label = paste0(customer_id)
+  ), color = "blue", size = 4) +
+  geom_text(data = latest_overall_point, aes(
+    x = session_date + x_offset, 
+    y = avg_purchase_to_cart_ratio_30d + y_offset,
+    label = "Overall"
+  ), color = "black", size = 4) +
+  labs(
+    x = "Session Date",
+    y = "30-Day Rolling Avg Purchase-to-Cart Ratio",
+    title = "Purchase-to-Cart Ratio Over Time (30-Day Rolling Avg)"
+  ) +
+  theme_minimal() +
+  theme(text = element_text(size = 12))
+```
+
+
+
+## Tenure
+
+```{r}
+
+ggplot(modeling_data_sessions, aes(
+  x = as.factor(session_abandoned),
+  y = orders_per_day + 1e-5,   # add small value if some are zero to use log scale
+  fill = as.factor(session_abandoned)
+)) +
+  geom_violin(alpha = 0.6) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  scale_y_log10() +  # optional if distribution is skewed
+  labs(
+    x = "Session Abandoned",
+    y = "Orders per Day (log scale)",
+    fill = "Session Abandoned"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12),
+    legend.position = "none"
+  )
+
+ggplot(modeling_data_sessions, aes(x = as.factor(session_abandoned), y = orders_per_day, fill = as.factor(session_abandoned))) +
+  geom_violin(alpha = 0.6) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  labs(
+    x = "Session Abandoned",
+    y = "Orders Per Day",
+    fill = "Session Abandoned"
+  ) +
+  theme_minimal() +
+  theme(text = element_text(size = 12), legend.position = "none") +
+  coord_cartesian(ylim = c(0, 50))  # zoom to range 0–1
+```
+
+# Normalized Data Features
+
+```{r}
+# Copy dataset to avoid overwriting
+normalized_data <- copy(modeling_data_sessions)
+
+# Identify numeric columns
+numeric_cols <- names(normalized_data)[sapply(normalized_data, is.numeric)]
+
+# Min-max normalize all numeric columns
+normalized_data[, (numeric_cols) := lapply(.SD, function(x) {
+  if (all(is.na(x))) return(x)  # keep NA-only columns as is
+  (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+}), .SDcols = numeric_cols]
+```
+
+```{r}
+cart_sessions_norm_model_data <- normalized_data %>%
+  select(-any_of(exclude_cols))
+```
+
+```{r}
+# Fit the tree
+tree_model_norm <- rpart(
+  session_abandoned ~ .,              # target vs all numeric predictors
+  data = cart_sessions_norm_model_data,
+  method = "class",                   # classification tree
+  control = rpart.control(
+    minsplit = 20,                    # minimum rows to attempt a split
+    cp = 0.001,                        # complexity parameter to prune tree
+    maxdepth = 4                      # keep tree shallow
+  )
+)
+
+rpart.plot(
+  tree_model_norm,
+  type = 2,        # type 2 = labels inside nodes
+  extra = 104,     # show probability per class and % observations
+  fallen.leaves = TRUE,
+  cex = 0.8
+)
+```
+
+# Cluster
+
+```{r}
+
+library(data.table)
+
+
+# Variables to use for clustering
+cluster_vars <- c(
+  "purchase_to_cart_ratio",
+  "n_adds",
+  "session_duration_mins",
+  "cart_event_count",
+  "checkout_event_count",
+  "is_quick_session",
+  "is_long_session",
+  "many_adds",
+  "is_evening",
+  "is_business_hours"
+)
+
+cluster_vars <- intersect(cluster_vars, names(modeling_data_sessions))
+
+# Make sure clustering vars are numeric and finite (Inf/NaN → NA)
+modeling_data_sessions[, (cluster_vars) := lapply(.SD, function(x) {
+  x <- as.numeric(x)
+  x[!is.finite(x)] <- NA_real_
+  x
+}), .SDcols = cluster_vars]
+
+# Build matrix, drop rows with any NA in clustering vars
+X <- as.matrix(modeling_data_sessions[, ..cluster_vars])
+good_rows <- complete.cases(X)
+X <- X[good_rows, , drop = FALSE]
+
+# Drop zero-variance columns
+var_ok <- apply(X, 2, function(z) sd(z) > 0)
+X <- X[, var_ok, drop = FALSE]
+
+# Scale and run k-means
+set.seed(123)
+km_fit <- kmeans(scale(X), centers = 4, nstart = 50)
+
+# Attach cluster back to main data.table
+modeling_data_sessions[, cluster := NA_integer_]
+modeling_data_sessions$cluster[good_rows] <- km_fit$cluster
+
+cluster_summary <- modeling_data_sessions[!is.na(cluster),
+  .(
+    n_sessions   = .N,
+    abandon_rate = mean(session_abandoned == 1)
+  ),
+  by = cluster
+][order(-abandon_rate)]
+
+cluster_summary
+
+
+```
+
+```{r}
+
+behavior_summary <- modeling_data_sessions[!is.na(cluster),
+  lapply(.SD, mean, na.rm = TRUE),
+  by = cluster,
+  .SDcols = cluster_vars
+]
+
+behavior_summary <- merge(
+  behavior_summary,
+  modeling_data_sessions[!is.na(cluster),
+    .(abandon_rate = mean(session_abandoned == 1)),
+    by = cluster
+  ],
+  by = "cluster"
+)
+
+behavior_summary
+
+```
+
+
+```{r}
+
+ggplot(cluster_summary, aes(x = factor(cluster), y = abandon_rate)) +
+  geom_col() +
+  geom_text(aes(label = scales::percent(abandon_rate, 0.1)),
+            vjust = -0.5, size = 4) +
+  labs(
+    title = "Abandonment Rate by Behavioral Cluster",
+    x = "Cluster",
+    y = "Abandonment Rate"
+  ) +
+  theme_minimal()
+
+
+beh_long <- melt(
+  behavior_summary,
+  id.vars = "cluster",
+  measure.vars = cluster_vars,
+  variable.name = "metric",
+  value.name = "mean_value"
+)
+
+ggplot(beh_long, aes(x = factor(cluster), y = mean_value)) +
+  geom_col() +
+  facet_wrap(~ metric, scales = "free_y") +
+  labs(
+    title = "Average Behavior by Cluster",
+    x = "Cluster",
+    y = "Mean value"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+
+# sample (optional) in case you have a ton of rows
+set.seed(123)
+plot_data <- modeling_data_sessions[!is.na(cluster)]
+if (nrow(plot_data) > 20000) {
+  plot_data <- plot_data[sample(.N, 20000)]
+}
+
+ggplot(plot_data,
+       aes(x = n_adds,
+           y = session_duration_mins,
+           color = factor(cluster))) +
+  geom_point(alpha = 0.3) +
+  labs(
+    title = "Session Behavior by Cluster",
+    x = "Number of adds",
+    y = "Session duration (mins)",
+    color = "Cluster"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+
+# plot_vars <- c("n_adds", "session_duration_mins", "cart_event_count",
+#                "begin_checkout", "proceed_to_checkout", "remove_from_cart")
+# 
+# GGally::ggparcoord(
+#   data = behavior_summary,
+#   columns = match(plot_vars, names(behavior_summary)),
+#   groupColumn = match("cluster", names(behavior_summary)),
+#   scale = "std"
+# ) +
+#   labs(
+#     title = "Parallel Coordinates Plot of Cluster Behavioral Profiles",
+#     x = "Behavior Variables",
+#     y = "Standardized Value"
+#   ) +
+#   theme_minimal() +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+library(reshape2)
+
+centers <- as.data.frame(km_fit$centers)
+centers$cluster <- rownames(centers)
+
+centers_long <- melt(centers, id = "cluster")
+
+ggplot(centers_long, aes(x = variable, y = cluster, fill = value)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  labs(
+    title = "Heatmap of Cluster Centers",
+    x = "Feature",
+    y = "Cluster"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+

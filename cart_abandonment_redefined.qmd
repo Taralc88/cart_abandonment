@@ -1,0 +1,884 @@
+---
+title: "Cart Abandonment Redefined"
+date: 10/26/2025
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    number-depth: 2
+    toc-location: left
+    toc-title: "Contents"
+    code-fold: false
+    code-summary: "Click to Show Code"
+    embed-resources: true
+execute:
+  include: true
+  eval: true    
+  warning: false
+  message: false---
+---
+
+# New Abandonment Definition
+- We define cart abandonment at the session level rather than the individual event level to better capture actual customer shopping behavior. A shopping session is defined as a sequence of add_to_cart events for a given customer where consecutive events occur within 30 minutes of each other. If more than 30 minutes elapse between add_to_cart events, a new session begins. This approach groups related shopping activity together—for example, a customer who adds five items to their cart over a 10-minute period is treated as a single shopping session, not five separate abandonment opportunities.
+
+- To identify purchases, we combine data from two sources: the Google Analytics purchase events and the Orders table (using the created_date_utc timestamp converted to EST). Since GA tracking can occasionally miss purchase events, incorporating the Orders table ensures comprehensive purchase capture. We deduplicate by customer and timestamp to avoid double-counting when a purchase appears in both data sources.
+
+- A session is flagged as abandoned if no purchase occurs within 72 hours (3 days) after the session ends. This 72-hour window accommodates the B2B purchasing patterns observed in our data, where customers may add items to cart during business hours but complete the purchase later, potentially through a sales representative or call center. The time-to-purchase is calculated from the end of the cart session (the timestamp of the last add_to_cart event in that session) to the next chronological purchase event for that customer. Sessions without any subsequent purchase, or where the purchase occurs beyond the 72-hour window, are classified as abandoned.
+
+- This session-based approach provides several analytical advantages: it reduces noise from rapid clicking behavior, aligns better with real-world shopping patterns, enables more meaningful intervention timing (e.g., triggering an email after a session ends rather than after every individual click), and surfaces new behavioral signals such as session duration, number of items added per session, and multiple sessions within the same day—all of which prove to be significant predictors of abandonment in our modeling.
+
+# Setup
+```{r}
+
+library(tidyverse)
+library(data.table)
+library(janitor)
+library(caret)
+library(randomForest)
+library(xgboost)
+
+
+customer <- fread("customer.csv") |> clean_names() |> 
+  rename(customer_id = customer_number)
+
+google_analytics <- fread("google_analytics.csv") |> clean_names()
+
+orders <- fread("orders.csv") |> clean_names()
+
+```
+
+
+# New Session Based Version of Abandonment
+
+### Time Zones 
+```{r}
+
+setDT(google_analytics)
+setDT(orders)
+
+# Handle timezones
+
+# GA timestamps - change to the same datatype we are using for orders
+google_analytics[, event_timestamp_est := force_tz(event_timestamp, tzone = "America/New_York")]
+
+# Orders timestamps - convert from UTC to EST
+orders[, created_timestamp_est := with_tz(created_date_utc, tzone = "America/New_York")]
+
+# Verify timezone conversion
+cat("Timezone verification:\n")
+cat("GA timestamp example:\n")
+print(google_analytics[1, .(event_timestamp, event_timestamp_est)])
+
+cat("\nOrders timestamp example:\n")
+print(orders[1, .(created_date_utc, created_timestamp_est)])
+
+```
+
+## Combine all purchases from GA + Orders table
+
+```{r}
+
+# Extract GA purchase events
+ga_purchase <- google_analytics[event_name == "purchase", 
+                                .(customer_id, 
+                                  purchase_ts = event_timestamp_est,
+                                  source = "GA")]
+
+cat("GA purchases:", nrow(ga_purchase), "\n")
+
+# Create purchase events from orders table
+# IMPORTANT: Orders table has multiple rows per order (line items)
+# We need to get unique orders by customer_id + timestamp
+orders_purchase <- unique(orders[, .(customer_id, 
+                                     purchase_ts = created_timestamp_est)],
+                         by = c("customer_id", "purchase_ts"))
+
+# Add source column
+orders_purchase[, source := "Orders"]
+
+cat("Orders purchases (unique orders):", nrow(orders_purchase), "\n")
+
+# Combine both sources
+all_purchases <- rbindlist(list(ga_purchase, orders_purchase), 
+                          use.names = TRUE)
+
+cat("Combined purchases (before deduplication):", nrow(all_purchases), "\n")
+
+# Now deduplicate by customer_id + purchase_ts
+all_purchases <- unique(all_purchases, by = c("customer_id", "purchase_ts"))
+
+cat("Combined purchases (after deduplication):", nrow(all_purchases), "\n")
+
+# Check how many were duplicates (overlap between GA and Orders)
+n_duplicates <- nrow(ga_purchase) + nrow(orders_purchase) - nrow(all_purchases)
+cat("Duplicates removed (GA-Orders overlap):", n_duplicates, "\n")
+cat("Percentage overlap:", round(n_duplicates / nrow(ga_purchase) * 100, 2), "% of GA purchases\n")
+
+# Check coverage
+cat("\nPurchases only in GA:", sum(ga_purchase$customer_id %in% setdiff(ga_purchase$customer_id, orders_purchase$customer_id)), "\n")
+cat("Purchases only in Orders:", nrow(orders_purchase) - n_duplicates, "\n")
+
+# Preview the data
+cat("\nSample of combined purchases:\n")
+print(head(all_purchases, 10))
+
+cat("\n✓ Step 2 complete: All purchases combined and deduplicated correctly\n")
+
+```
+
+## Extract add_to_cart events
+```{r}
+
+
+# Extract all add_to_cart events from GA
+ga_add_to_cart <- google_analytics[event_name == "add_to_cart", 
+                                   .(customer_id, 
+                                     add_to_cart_ts = event_timestamp_est)]
+
+cat("Total add_to_cart events:", nrow(ga_add_to_cart), "\n")
+
+# Check distribution by customer
+customer_cart_counts <- ga_add_to_cart[, .N, by = customer_id]
+cat("\nAdd to cart distribution:\n")
+cat("Unique customers with add_to_cart:", nrow(customer_cart_counts), "\n")
+cat("Avg add_to_cart events per customer:", round(mean(customer_cart_counts$N), 2), "\n")
+cat("Median add_to_cart events per customer:", median(customer_cart_counts$N), "\n")
+cat("Max add_to_cart events by one customer:", max(customer_cart_counts$N), "\n")
+
+# Preview
+cat("\nSample add_to_cart events:\n")
+print(head(ga_add_to_cart, 10))
+
+cat("\n✓ Step 3 complete: Add to cart events extracted\n")
+
+```
+
+## Match add_to_cart with purchases
+
+```{r}
+
+# Cart Abandonment Analysis - Step 4: Match add_to_cart with NEXT purchase
+# Using timestamp offset approach
+
+# Create a version of purchases with a small offset for the join
+# This ensures we find purchases AFTER the add_to_cart, not at the exact same time
+all_purchases_offset <- copy(all_purchases)
+all_purchases_offset[, purchase_ts_for_join := purchase_ts + 1]  # Add 1 second
+
+# Sort and key
+setorder(all_purchases_offset, customer_id, purchase_ts_for_join)
+setorder(ga_add_to_cart, customer_id, add_to_cart_ts)
+
+setkey(all_purchases_offset, customer_id, purchase_ts_for_join)
+setkey(ga_add_to_cart, customer_id, add_to_cart_ts)
+
+cat("Tables prepared for rolling join\n\n")
+
+# Perform rolling join
+# Now we're joining on offset timestamps, so exact matches won't happen
+cart_with_purchase <- all_purchases_offset[ga_add_to_cart, 
+                                           on = .(customer_id, purchase_ts_for_join = add_to_cart_ts),
+                                           roll = -Inf]
+
+cat("Rolling join complete\n")
+cat("Result has", nrow(cart_with_purchase), "rows\n\n")
+
+# Rename columns
+setnames(cart_with_purchase, c("purchase_ts", "purchase_ts_for_join"), 
+         c("matched_purchase_ts", "add_to_cart_ts"))
+
+# Reorder columns
+setcolorder(cart_with_purchase, c("customer_id", "add_to_cart_ts", "matched_purchase_ts", "source"))
+
+# Quick diagnostic
+no_purchase <- sum(is.na(cart_with_purchase$matched_purchase_ts))
+has_purchase <- sum(!is.na(cart_with_purchase$matched_purchase_ts))
+
+cat("Quick check:\n")
+cat("- No purchase found:", no_purchase, "\n")
+cat("- Has purchase:", has_purchase, "\n\n")
+
+# Show sample with time differences
+cat("Sample of joined data:\n")
+sample_data <- head(cart_with_purchase, 20)
+sample_data[, time_diff_hours := as.numeric(difftime(matched_purchase_ts, add_to_cart_ts, units = "hours"))]
+print(sample_data)
+
+# Check distribution of time differences
+if(has_purchase > 0) {
+  cart_with_purchase[, time_diff_hours := as.numeric(difftime(matched_purchase_ts, add_to_cart_ts, units = "hours"))]
+  
+  cat("\nTime difference distribution:\n")
+  cat("Min:", min(cart_with_purchase$time_diff_hours, na.rm = TRUE), "hours\n")
+  cat("Median:", median(cart_with_purchase$time_diff_hours, na.rm = TRUE), "hours\n")
+  cat("Mean:", round(mean(cart_with_purchase$time_diff_hours, na.rm = TRUE), 2), "hours\n")
+  cat("Max:", max(cart_with_purchase$time_diff_hours, na.rm = TRUE), "hours\n")
+}
+
+cat("\n✓ Step 4 complete\n")
+```
+
+## Session Logic and Definitions
+```{r}
+# Define a cart session if gap between add_to_cart events > 30 minutes
+ga_add_to_cart <- ga_add_to_cart[
+  order(customer_id, add_to_cart_ts)
+][, session_id := cumsum(
+     as.numeric(difftime(add_to_cart_ts, shift(add_to_cart_ts, 1, type="lag"), units="mins")) > 30 |
+     is.na(shift(customer_id, 1)) |
+     customer_id != shift(customer_id, 1)
+   ),
+   by = customer_id
+]
+
+# Summarize sessions
+cart_sessions <- ga_add_to_cart[, .(
+  session_start = min(add_to_cart_ts),
+  session_end = max(add_to_cart_ts),
+  n_adds = .N
+), by = .(customer_id, session_id)]
+
+# Match sessions to purchases within 72h after session_end
+setkey(cart_sessions, customer_id, session_end)
+setkey(all_purchases, customer_id, purchase_ts)
+
+cart_sessions[, purchase_ts := all_purchases[cart_sessions, 
+   on = .(customer_id, purchase_ts > session_end), mult = "first", x.purchase_ts]]
+
+cart_sessions[, converted := ifelse(
+  !is.na(purchase_ts) & difftime(purchase_ts, session_end, units="hours") <= 72, 1, 0)]
+```
+
+## Define Abandonment Window
+
+### Create Abandonment 
+Here we use 72 hours as the window that a user has to make a a purchase, if there are no purchase events in this timeframe it is flagged as abandoned. 
+```{r}
+# Configuration
+ABANDONMENT_WINDOW_HOURS <- 72
+SESSION_GAP_MINUTES <- 30
+
+cat("=== SESSION-BASED CART ABANDONMENT ===\n")
+cat("Session gap:", SESSION_GAP_MINUTES, "minutes\n")
+cat("Abandonment window:", ABANDONMENT_WINDOW_HOURS, "hours\n\n")
+
+# STEP 1: Create shopping sessions from add_to_cart events
+cat("Step 1: Creating shopping sessions...\n")
+
+ga_add_to_cart_sessions <- copy(ga_add_to_cart)
+ga_add_to_cart_sessions <- ga_add_to_cart_sessions[order(customer_id, add_to_cart_ts)]
+
+# Create session IDs based on 30-minute gaps
+ga_add_to_cart_sessions[, `:=`(
+  time_since_last = as.numeric(difftime(add_to_cart_ts, shift(add_to_cart_ts, 1), units = "mins")),
+  customer_changed = customer_id != shift(customer_id, 1)
+)]
+
+ga_add_to_cart_sessions[, new_session := is.na(time_since_last) | 
+                                         customer_changed | 
+                                         time_since_last > SESSION_GAP_MINUTES]
+
+ga_add_to_cart_sessions[, session_id := cumsum(new_session)]
+
+# Summarize sessions
+cart_sessions <- ga_add_to_cart_sessions[, .(
+  session_start = min(add_to_cart_ts),
+  session_end = max(add_to_cart_ts),
+  n_adds = .N,
+  session_duration_mins = as.numeric(difftime(max(add_to_cart_ts), min(add_to_cart_ts), units = "mins"))
+), by = .(customer_id, session_id)]
+
+cat("Created", nrow(cart_sessions), "shopping sessions from", nrow(ga_add_to_cart), "add_to_cart events\n")
+cat("Avg adds per session:", round(mean(cart_sessions$n_adds), 2), "\n\n")
+
+# STEP 2: Match sessions to purchases
+cat("Step 2: Matching sessions to purchases...\n")
+
+# Use offset method like before
+all_purchases_offset <- copy(all_purchases)
+all_purchases_offset[, purchase_ts_for_join := purchase_ts + 1]
+
+setorder(all_purchases_offset, customer_id, purchase_ts_for_join)
+setorder(cart_sessions, customer_id, session_end)
+
+setkey(all_purchases_offset, customer_id, purchase_ts_for_join)
+setkey(cart_sessions, customer_id, session_end)
+
+# Rolling join to find next purchase after session end
+cart_sessions_matched <- all_purchases_offset[cart_sessions, 
+                                              on = .(customer_id, purchase_ts_for_join = session_end),
+                                              roll = -Inf]
+
+setnames(cart_sessions_matched, c("purchase_ts", "purchase_ts_for_join"), 
+         c("matched_purchase_ts", "session_end"))
+
+# Reorder columns
+setcolorder(cart_sessions_matched, c("customer_id", "session_id", "session_start", 
+                                     "session_end", "n_adds", "session_duration_mins",
+                                     "matched_purchase_ts", "source"))
+
+cat("Sessions matched to purchases\n\n")
+
+# STEP 3: Calculate time to purchase and flag abandonment
+cat("Step 3: Flagging session abandonment...\n")
+
+cart_sessions_matched[, time_to_purchase_hours := 
+  as.numeric(difftime(matched_purchase_ts, session_end, units = "hours"))]
+
+cart_sessions_matched[, session_abandoned := ifelse(
+  is.na(matched_purchase_ts) | time_to_purchase_hours > ABANDONMENT_WINDOW_HOURS,
+  1,
+  0
+)]
+
+cat("Session-level abandonment:\n")
+cat("Total sessions:", nrow(cart_sessions_matched), "\n")
+cat("Abandoned sessions:", sum(cart_sessions_matched$session_abandoned), "\n")
+cat("Converted sessions:", sum(1 - cart_sessions_matched$session_abandoned), "\n")
+cat("Session abandonment rate:", round(mean(cart_sessions_matched$session_abandoned) * 100, 2), "%\n\n")
+```
+
+### Create session-level features for modeling
+
+```{r}
+cat("Step 4: Creating session-level features...\n")
+
+modeling_data_sessions <- copy(cart_sessions_matched)
+
+# Temporal features based on session_start
+modeling_data_sessions[, `:=`(
+  hour_of_day = hour(session_start),
+  day_of_week = wday(session_start),
+  day_of_month = mday(session_start),
+  month = month(session_start),
+  is_weekend = ifelse(wday(session_start) %in% c(1, 7), 1, 0),
+  is_business_hours = ifelse(hour(session_start) >= 9 & hour(session_start) <= 17, 1, 0),
+  is_evening = ifelse(hour(session_start) >= 18, 1, 0),
+  is_morning = ifelse(hour(session_start) >= 6 & hour(session_start) < 12, 1, 0),
+  session_date = as.Date(session_start)
+)]
+
+# Session-specific features
+modeling_data_sessions[, `:=`(
+  is_quick_session = ifelse(session_duration_mins < 5, 1, 0),
+  is_long_session = ifelse(session_duration_mins > 30, 1, 0),
+  many_adds = ifelse(n_adds >= 5, 1, 0)
+)]
+
+# Customer history features
+customer_overall_stats <- google_analytics[, .(
+  total_purchases_ever = sum(event_name == "purchase"),
+  total_add_to_carts_ever = sum(event_name == "add_to_cart"),
+  total_page_views_ever = sum(event_name == "page_view"),
+  total_events_ever = .N,
+  first_event_date = min(event_timestamp_est),
+  last_event_date = max(event_timestamp_est)
+), by = customer_id]
+
+customer_overall_stats[, customer_tenure_days := 
+  as.numeric(difftime(last_event_date, first_event_date, units = "days"))]
+
+modeling_data_sessions <- merge(modeling_data_sessions, customer_overall_stats, 
+                               by = "customer_id", all.x = TRUE)
+
+modeling_data_sessions[, days_since_first_event := 
+  as.numeric(difftime(session_start, first_event_date, units = "days"))]
+
+# Order history features
+customer_order_stats <- orders[, .(
+  total_orders = uniqueN(created_timestamp_est),
+  total_order_items = .N,
+  avg_order_quantity = mean(order_quantity),
+  pct_call_center = sum(order_type == "CALL CENTER") / .N,
+  unique_materials_ordered = uniqueN(material_id),
+  unique_plants = uniqueN(plant_id)
+), by = customer_id]
+
+modeling_data_sessions <- merge(modeling_data_sessions, customer_order_stats, 
+                               by = "customer_id", all.x = TRUE)
+
+# Session frequency features (how many sessions this customer had that day)
+daily_session_counts <- modeling_data_sessions[, .(
+  sessions_same_day = .N
+), by = .(customer_id, session_date)]
+
+modeling_data_sessions <- merge(modeling_data_sessions, daily_session_counts, 
+                               by = c("customer_id", "session_date"), all.x = TRUE)
+
+# Session sequence
+modeling_data_sessions[order(customer_id, session_start), 
+                      session_sequence_in_day := seq_len(.N), 
+                      by = .(customer_id, session_date)]
+
+# Clean up NAs
+numeric_cols <- names(modeling_data_sessions)[sapply(modeling_data_sessions, is.numeric)]
+for (col in numeric_cols) {
+  modeling_data_sessions[is.na(get(col)), (col) := 0]
+}
+
+# Create derived features
+modeling_data_sessions[, purchase_to_cart_ratio := ifelse(total_add_to_carts_ever > 0, 
+                                                           total_purchases_ever / total_add_to_carts_ever, 
+                                                           0)]
+
+modeling_data_sessions[, avg_adds_per_session := total_add_to_carts_ever / 
+                                                 (.N + 1)]  # +1 to avoid division by zero
+
+cat("✓ Session-level modeling dataset ready\n\n")
+
+# SUMMARY
+cat("=== SESSION-BASED MODELING DATASET ===\n")
+cat("Total sessions:", nrow(modeling_data_sessions), "\n")
+cat("Total features:", ncol(modeling_data_sessions), "\n")
+cat("Target: session_abandoned\n")
+cat("Abandonment rate:", round(mean(modeling_data_sessions$session_abandoned) * 100, 2), "%\n\n")
+
+cat("Key differences from event-level:\n")
+cat("- Unit of analysis: Session (not individual add_to_cart)\n")
+cat("- Features: session_duration_mins, n_adds, sessions_same_day\n")
+cat("- Better captures: Shopping behavior patterns\n\n")
+
+cat("✓ Ready for session-based modeling!\n")
+```
+
+
+# Predictive Modeling Dataset Prep
+## Modeling Dataset 
+
+```{r}
+# Select features for modeling (exclude identifiers and timestamps)
+exclude_cols <- c("customer_id", "session_id", "session_start", "session_end", 
+                  "matched_purchase_ts", "session_date", 
+                  "first_event_date", "last_event_date", "source", 
+                  "time_to_purchase_hours", "time_since_last", "customer_changed", "new_session")
+
+# Get numeric features
+numeric_features <- names(modeling_data_sessions)[sapply(modeling_data_sessions, is.numeric)]
+numeric_features <- setdiff(numeric_features, c("session_abandoned", exclude_cols))
+
+cat("Selected", length(numeric_features), "numeric features\n")
+cat("Target variable: session_abandoned\n\n")
+
+# Prepare modeling dataset
+model_features <- c("session_abandoned", numeric_features)
+model_df <- modeling_data_sessions[, ..model_features]
+
+# Remove any rows with NA
+model_df <- na.omit(model_df)
+
+cat("Clean modeling dataset:", nrow(model_df), "sessions\n")
+cat("Target distribution:\n")
+print(table(model_df$session_abandoned))
+cat("\nAbandonment rate:", round(mean(model_df$session_abandoned) * 100, 2), "%\n\n")
+
+# Split into train/test (80/20)
+set.seed(123)
+train_idx <- sample(seq_len(nrow(model_df)), size = 0.8 * nrow(model_df))
+train_data <- model_df[train_idx]
+test_data <- model_df[-train_idx]
+
+cat("Training set:", nrow(train_data), "sessions\n")
+cat("Test set:", nrow(test_data), "sessions\n\n")
+```
+
+# Modeling 
+
+## Logistic Regression Model
+```{r}
+cat("=== MODEL 1: LOGISTIC REGRESSION ===\n\n")
+
+# Build formula
+formula_glm <- as.formula(paste("session_abandoned ~", paste(numeric_features, collapse = " + ")))
+
+# Train model
+cat("Training logistic regression...\n")
+logit_model <- glm(formula_glm, data = train_data, family = binomial())
+
+# Predictions
+train_data[, pred_logit := predict(logit_model, newdata = train_data, type = "response")]
+test_data[, pred_logit := predict(logit_model, newdata = test_data, type = "response")]
+
+train_data[, pred_logit_class := ifelse(pred_logit > 0.5, 1, 0)]
+test_data[, pred_logit_class := ifelse(pred_logit > 0.5, 1, 0)]
+
+# Performance
+cat("\nLogistic Regression Performance:\n")
+cat("TEST SET:\n")
+test_cm_logit <- confusionMatrix(factor(test_data$pred_logit_class), 
+                                 factor(test_data$session_abandoned))
+print(test_cm_logit)
+
+# Feature importance
+cat("\n=== TOP 20 MOST SIGNIFICANT FEATURES (Logistic) ===\n")
+coef_summary <- summary(logit_model)$coefficients
+coef_summary <- coef_summary[order(coef_summary[, 4]), ]
+print(head(coef_summary, 21))
+
+cat("\n✓ Logistic regression complete\n\n")
+```
+
+
+## Random Forest Model
+```{r}
+
+cat("=== MODEL 2: RANDOM FOREST ===\n\n")
+
+# Prepare data
+train_rf <- copy(train_data)
+test_rf <- copy(test_data)
+
+train_rf[, session_abandoned := factor(session_abandoned, levels = c(0, 1))]
+test_rf[, session_abandoned := factor(session_abandoned, levels = c(0, 1))]
+
+# Sample if needed
+if (nrow(train_rf) > 50000) {
+  cat("Sampling 50,000 sessions for faster training...\n")
+  sample_idx <- sample(1:nrow(train_rf), 50000)
+  train_rf_sample <- train_rf[sample_idx]
+} else {
+  train_rf_sample <- train_rf
+}
+
+# Train Random Forest
+cat("Training Random Forest...\n")
+set.seed(123)
+rf_model <- randomForest(
+  x = train_rf_sample[, ..numeric_features],
+  y = train_rf_sample$session_abandoned,
+  ntree = 100,
+  importance = TRUE,
+  na.action = na.omit
+)
+
+# Predictions
+train_rf[, pred_rf := predict(rf_model, newdata = train_rf[, ..numeric_features], type = "prob")[, 2]]
+train_rf[, pred_rf_class := predict(rf_model, newdata = train_rf[, ..numeric_features], type = "class")]
+
+test_rf[, pred_rf := predict(rf_model, newdata = test_rf[, ..numeric_features], type = "prob")[, 2]]
+test_rf[, pred_rf_class := predict(rf_model, newdata = test_rf[, ..numeric_features], type = "class")]
+
+# Performance
+cat("\nRandom Forest Performance:\n")
+cat("TEST SET:\n")
+test_cm_rf <- confusionMatrix(test_rf$pred_rf_class, test_rf$session_abandoned)
+print(test_cm_rf)
+
+# Feature importance
+cat("\n=== TOP 20 MOST IMPORTANT FEATURES (Random Forest) ===\n")
+importance_df <- as.data.frame(importance(rf_model))
+importance_df$feature <- rownames(importance_df)
+importance_df <- importance_df[order(-importance_df$MeanDecreaseGini), ]
+print(head(importance_df[, c("feature", "MeanDecreaseGini", "MeanDecreaseAccuracy")], 20))
+
+cat("\n✓ Random Forest complete\n\n")
+
+
+```
+
+## XGBoost Model
+```{r}
+# ============================================================================
+# MODEL 3: XGBOOST
+# ============================================================================
+cat("=== MODEL 3: XGBOOST ===\n\n")
+
+# Prepare data
+train_xgb <- copy(train_data)
+test_xgb <- copy(test_data)
+
+# Convert to numeric if needed
+if (is.factor(train_xgb$session_abandoned)) {
+  train_xgb[, session_abandoned := as.numeric(as.character(session_abandoned))]
+  test_xgb[, session_abandoned := as.numeric(as.character(session_abandoned))]
+}
+
+train_matrix <- xgb.DMatrix(
+  data = as.matrix(train_xgb[, ..numeric_features]),
+  label = train_xgb$session_abandoned
+)
+
+test_matrix <- xgb.DMatrix(
+  data = as.matrix(test_xgb[, ..numeric_features]),
+  label = test_xgb$session_abandoned
+)
+
+# Train XGBoost
+cat("Training XGBoost...\n")
+set.seed(123)
+xgb_model <- xgb.train(
+  data = train_matrix,
+  params = list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    max_depth = 6,
+    eta = 0.3,
+    subsample = 0.8,
+    colsample_bytree = 0.8
+  ),
+  nrounds = 100,
+  verbose = 0
+)
+
+# Predictions
+train_xgb[, pred_xgb := predict(xgb_model, train_matrix)]
+train_xgb[, pred_xgb_class := ifelse(pred_xgb > 0.5, 1, 0)]
+
+test_xgb[, pred_xgb := predict(xgb_model, test_matrix)]
+test_xgb[, pred_xgb_class := ifelse(pred_xgb > 0.5, 1, 0)]
+
+# Performance
+cat("\nXGBoost Performance:\n")
+cat("TEST SET:\n")
+test_cm_xgb <- confusionMatrix(factor(test_xgb$pred_xgb_class), 
+                               factor(test_xgb$session_abandoned))
+print(test_cm_xgb)
+
+# Feature importance
+cat("\n=== TOP 20 MOST IMPORTANT FEATURES (XGBoost) ===\n")
+importance_xgb <- xgb.importance(model = xgb_model)
+print(head(importance_xgb, 20))
+
+cat("\n✓ XGBoost complete\n\n")
+
+
+```
+
+# Model Comparison and Insights
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# MODEL COMPARISON
+
+cat("=== MODEL COMPARISON (TEST SET) ===\n\n")
+
+comparison <- data.frame(
+  Model = c("Logistic Regression", "Random Forest", "XGBoost"),
+  Accuracy = c(
+    test_cm_logit$overall["Accuracy"],
+    test_cm_rf$overall["Accuracy"],
+    test_cm_xgb$overall["Accuracy"]
+  ),
+  Sensitivity = c(
+    test_cm_logit$byClass["Sensitivity"],
+    test_cm_rf$byClass["Sensitivity"],
+    test_cm_xgb$byClass["Sensitivity"]
+  ),
+  Specificity = c(
+    test_cm_logit$byClass["Specificity"],
+    test_cm_rf$byClass["Specificity"],
+    test_cm_xgb$byClass["Specificity"]
+  )
+)
+
+print(comparison)
+
+cat("\n=== SESSION-BASED MODELING COMPLETE ===\n\n")
+
+cat("Key Insights from Session-Based Approach:\n")
+cat("- Analyzing SESSIONS (not individual clicks) = better business understanding\n")
+cat("- Session features (duration, # adds) provide NEW insights\n")
+cat("- Multiple sessions same day = important signal\n")
+cat("- Compare these results to event-level to see differences\n\n")
+
+cat("Look for:\n")
+cat("1. Are quick sessions (<5 min) more likely to abandon?\n")
+cat("2. Do long sessions (>30 min) convert better?\n")
+cat("3. Does # of items added in session matter?\n")
+cat("4. Are multiple sessions/day a good or bad sign?\n")
+
+```
+
+
+## Cart Abandonment Behavior Insights
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# ============================================================================
+# PART 1: SESSION BEHAVIOR PATTERNS
+# ============================================================================
+
+cat("=== PART 1: SESSION BEHAVIOR ANALYSIS ===\n\n")
+
+# Question 1: Quick sessions vs abandonment
+quick_sessions <- modeling_data_sessions[, .(
+  total_sessions = .N,
+  abandoned = sum(session_abandoned),
+  abandonment_rate = mean(session_abandoned)
+), by = is_quick_session]
+
+cat("1. QUICK SESSIONS (<5 minutes):\n")
+print(quick_sessions)
+cat("\n")
+
+if (quick_sessions[is_quick_session == 1]$abandonment_rate > 
+    quick_sessions[is_quick_session == 0]$abandonment_rate) {
+  cat("→ Quick sessions ABANDON MORE (impulse browsing, not serious buyers)\n\n")
+} else {
+  cat("→ Quick sessions CONVERT BETTER (decisive buyers!)\n\n")
+}
+
+# Question 2: Long sessions vs abandonment
+long_sessions <- modeling_data_sessions[, .(
+  total_sessions = .N,
+  abandoned = sum(session_abandoned),
+  abandonment_rate = mean(session_abandoned)
+), by = is_long_session]
+
+cat("2. LONG SESSIONS (>30 minutes):\n")
+print(long_sessions)
+cat("\n")
+
+if (long_sessions[is_long_session == 1]$abandonment_rate < 
+    long_sessions[is_long_session == 0]$abandonment_rate) {
+  cat("→ Long sessions CONVERT BETTER (thorough research leads to purchase)\n\n")
+} else {
+  cat("→ Long sessions ABANDON MORE (analysis paralysis or complex issues)\n\n")
+}
+
+# Question 3: Number of items added
+adds_analysis <- modeling_data_sessions[, .(
+  avg_abandonment_rate = mean(session_abandoned),
+  total_sessions = .N
+), by = .(n_adds_bin = cut(n_adds, breaks = c(0, 1, 3, 5, 10, Inf), 
+                            labels = c("1 item", "2-3 items", "4-5 items", 
+                                     "6-10 items", "10+ items")))]
+
+cat("3. ITEMS ADDED PER SESSION:\n")
+print(adds_analysis[order(n_adds_bin)])
+cat("\n")
+
+# Question 4: Multiple sessions same day
+multiple_sessions <- modeling_data_sessions[, .(
+  total_sessions = .N,
+  abandoned = sum(session_abandoned),
+  abandonment_rate = mean(session_abandoned)
+), by = .(sessions_same_day_cat = cut(sessions_same_day, 
+                                      breaks = c(0, 1, 2, 3, Inf),
+                                      labels = c("1 session", "2 sessions", 
+                                               "3 sessions", "4+ sessions")))]
+
+cat("4. MULTIPLE SESSIONS SAME DAY:\n")
+print(multiple_sessions[order(sessions_same_day_cat)])
+cat("\n")
+```
+
+### Event level vs Session approach
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# ============================================================================
+# PART 2: COMPARE EVENT-LEVEL VS SESSION-LEVEL
+# ============================================================================
+
+cat("=== PART 2: EVENT-LEVEL VS SESSION-LEVEL COMPARISON ===\n\n")
+
+cat("METRICS COMPARISON:\n")
+cat(sprintf("%-30s %15s %15s\n", "Metric", "Event-Level", "Session-Level"))
+cat(sprintf("%-30s %15s %15s\n", "---", "---", "---"))
+cat(sprintf("%-30s %15d %15d\n", "Total observations", 
+            nrow(cart_with_purchase), nrow(modeling_data_sessions)))
+cat(sprintf("%-30s %15.2f%% %14.2f%%\n", "Abandonment rate",
+            mean(cart_with_purchase$cart_abandoned) * 100,
+            mean(modeling_data_sessions$session_abandoned) * 100))
+cat(sprintf("%-30s %15.2f%% %14.2f%%\n", "Best model accuracy",
+            96.49, 86.28))  # From your results
+cat("\n")
+```
+
+### Top Features
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# ============================================================================
+# PART 3: TOP FEATURE INSIGHTS FROM SESSION MODELS
+# ============================================================================
+
+cat("=== PART 3: KEY DRIVERS OF SESSION ABANDONMENT ===\n\n")
+
+cat("From XGBoost feature importance (most predictive model):\n\n")
+
+cat("1. PURCHASE_TO_CART_RATIO (Historical behavior)\n")
+cat("   - Still #1 predictor even at session level\n")
+cat("   - Customers with poor conversion history repeat the pattern\n")
+cat("   ACTION: Risk score based on this ratio\n\n")
+
+cat("2. SESSIONS_SAME_DAY (Session frequency)\n")
+cat("   - NEW insight from session-based approach!\n")
+cat("   - Multiple sessions = indecision or comparison shopping\n")
+cat("   ACTION: Trigger help/chat after 2nd session same day\n\n")
+
+cat("3. DAYS_SINCE_FIRST_EVENT (Customer lifecycle)\n")
+cat("   - Consistent with event-level findings\n")
+cat("   - Newer customers need more support\n")
+cat("   ACTION: Enhanced onboarding first 30 days\n\n")
+
+cat("4. N_ADDS (Items per session)\n")
+cat("   - NEW session-specific feature!\n")
+cat("   - Shows intent and complexity\n")
+cat("   ACTION: Different support for 1 item vs 10+ items\n\n")
+
+cat("5. SESSION_DURATION_MINS (Time spent)\n")
+cat("   - NEW session-specific feature!\n")
+cat("   - Very quick or very long sessions behave differently\n")
+cat("   ACTION: Monitor session length for intervention timing\n\n")
+
+```
+
+### Business Recommendations
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# ============================================================================
+# PART 4: BUSINESS RECOMMENDATIONS
+# ============================================================================
+
+cat("=== PART 4: ACTIONABLE BUSINESS RECOMMENDATIONS ===\n\n")
+
+cat("TIER 1 - IMMEDIATE ACTIONS (High Impact, Easy Implementation):\n\n")
+
+cat("1. SESSION-BASED CART ABANDONMENT EMAILS\n")
+cat("   - Wait for SESSION to end (30 min of inactivity)\n")
+cat("   - Don't email after every single add_to_cart click\n")
+cat("   - Personalize based on # items added\n\n")
+
+cat("2. MULTI-SESSION DETECTION\n")
+cat("   - If customer starts 2nd session same day → trigger live chat\n")
+cat("   - \"Having trouble? Can we help you decide?\"\n")
+cat("   - Especially for customers with low purchase_to_cart_ratio\n\n")
+
+cat("3. QUICK SESSION ALERTS\n")
+cat("   - Sessions < 2 minutes with 1 item = likely just browsing\n")
+cat("   - Don't aggressively follow up (low intent)\n")
+cat("   - But DO retarget with relevant content later\n\n")
+
+cat("TIER 2 - MEDIUM-TERM (Require Development):\n\n")
+
+cat("4. PREDICTIVE ABANDONMENT SCORING\n")
+cat("   - Use XGBoost model to score sessions in real-time\n")
+cat("   - Risk score = probability of abandonment\n")
+cat("   - Trigger interventions at critical moments\n\n")
+
+cat("5. SESSION TIMEOUT OPTIMIZATION\n")
+cat("   - Current: 30 minutes defines new session\n")
+cat("   - Test different thresholds (15, 45, 60 minutes)\n")
+cat("   - Find optimal balance for your business\n\n")
+
+cat("6. SMART RECOMMENDATIONS\n")
+cat("   - In long sessions (>20 min), offer \"Frequently Bought Together\"\n")
+cat("   - In multi-session cases, show \"Items you viewed earlier\"\n")
+cat("   - Help reduce decision fatigue\n\n")
+
+cat("TIER 3 - STRATEGIC (Long-term initiatives):\n\n")
+
+cat("7. CUSTOMER SEGMENTATION BY SESSION BEHAVIOR\n")
+cat("   - Quick Deciders: Fast sessions, convert quickly\n")
+cat("   - Researchers: Long sessions, multiple visits\n")
+cat("   - Browsers: Very quick, low intent\n")
+cat("   - Different strategies for each\n\n")
+
+cat("8. A/B TEST INTERVENTIONS\n")
+cat("   - Test different email timing (immediately vs 24hr)\n")
+cat("   - Test different incentives by segment\n")
+cat("   - Measure impact on conversion\n\n")
+
+cat("9. BUILD ABANDONMENT PREVENTION FEATURES\n")
+cat("   - \"Save Cart\" functionality\n")
+cat("   - \"Email this cart to sales rep\" button\n")
+cat("   - \"Schedule delivery\" to reduce urgency pressure\n\n")
+```
+
+```{r}
+write.csv(cart_sessions_matched, "cart_sessions_matched.csv", row.names = FALSE)
+```
